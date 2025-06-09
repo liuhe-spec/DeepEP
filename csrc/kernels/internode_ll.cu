@@ -41,13 +41,14 @@ __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count,
+         int* cumulative_local_expert_recv_stats,
          void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
          const void* x, const int64_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
          int* next_clean, int num_next_clean_int,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
-         int phases) {
+         int* usage_flag, int phases) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -180,6 +181,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             #pragma unroll
             for (int i = lane_id; i < num_experts; i += 32)
                 atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
+        } else if (sm_id == 1) {
+            // The second SM is also responsible for notifying PCIe usage
+            if (lane_id == 0)
+                atomicAdd_system(usage_flag, 1);
         }
 
         // This SM should be responsible for some destination experts, read `topk_idx` for them
@@ -269,6 +274,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
+            if (cumulative_local_expert_recv_stats != nullptr)
+                atomicAdd(cumulative_local_expert_recv_stats + local_expert_idx, num_recv_tokens);
         }
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(kNumWarpsPerGroup * 32));
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
@@ -306,12 +313,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count,
+              int* cumulative_local_expert_recv_stats,
               void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
               const void* x, const int64_t* topk_idx,
               int* next_clean, int num_next_clean_int,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int phases) {
+              void* workspace, int* usage_flag,
+              cudaStream_t stream, int phases) {
     constexpr int kNumMaxTopK = 9;
     constexpr int kNumWarpsPerGroup = 10;
     constexpr int kNumWarpGroups = 3;
@@ -333,12 +342,14 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
               packed_recv_count, \
+              cumulative_local_expert_recv_stats, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean, num_next_clean_int, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, phases); } break
+              num_topk, num_experts, rank, num_ranks, \
+              usage_flag, phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -356,7 +367,7 @@ combine(void* combined_x,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
-        int phases, bool zero_copy) {
+        int* usage_flag, int phases, bool zero_copy) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -451,11 +462,14 @@ combine(void* combined_x,
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
         return;
 
-    // Wait all ranks to arrive
+    // Wait all ranks to arrive and notify usages
     if (responsible_expert_idx < num_experts) {
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
-        if (sub_warp_id == 0 and lane_id == 0)
+        if (sub_warp_id == 0 and lane_id == 0) {
             while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx) == 0);
+        } else if (sm_id == 0 and sub_warp_id == 1 and lane_id == 0) {
+            atomicAdd_system(usage_flag, 1);
+        }
     }
     cg::this_grid().sync();
 
@@ -506,8 +520,8 @@ void combine(void* combined_x,
              int* next_clean, int num_next_clean_int,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
-             void* workspace, cudaStream_t stream,
-             int phases, bool zero_copy) {
+             void* workspace, int* usage_flag,
+             cudaStream_t stream, int phases, bool zero_copy) {
     constexpr int kNumWarpsPerGroup = 10;
     constexpr int kNumWarpGroups = 3;
     constexpr int kNumMaxTopk = 9;
@@ -531,6 +545,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
+              usage_flag, \
               phases, zero_copy); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);

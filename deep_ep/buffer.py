@@ -32,7 +32,8 @@ class Buffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
                  low_latency_mode: bool = False, num_qps_per_rank: int = 12,
-                 allow_nvlink_for_low_latency_mode: bool = True) -> None:
+                 allow_nvlink_for_low_latency_mode: bool = True,
+                 allow_mnnvl: bool = False) -> None:
         """
         Initialize the communication buffer.
 
@@ -47,6 +48,7 @@ class Buffer:
                 this is somehow incompatible with the hook-based overlapping.
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
+            allow_mnnvl: whether to allow MNNVL
         """
 
         # Initialize the CPP runtime
@@ -79,8 +81,18 @@ class Buffer:
             os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
             os.environ['NVSHMEM_QP_DEPTH'] = '1024'
+
+            # Reduce gpu memory usage
+            # 6 default teams + 1 extra team
+            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+            # Disable NVLink SHArP
+            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
             # NOTES: NVSHMEM initialization requires at least 256 MiB
             os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+
+            if not allow_mnnvl:
+                # Disable multi-node NVLink detection
+                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
             # Synchronize using the root ID
             nvshmem_unique_ids = [None, ] * self.group_size
@@ -162,8 +174,8 @@ class Buffer:
         """
 
         config_map = {
-            2: Config(Buffer.num_sms, 16, 256, 6, 128),
-            4: Config(Buffer.num_sms, 16, 256, 6, 128),
+            2: Config(Buffer.num_sms, 24, 256, 6, 128),
+            4: Config(Buffer.num_sms, 6, 256, 6, 128),
             8: Config(Buffer.num_sms, 6, 256, 6, 128),
             16: Config(Buffer.num_sms, 16, 288, 20, 128),
             24: Config(Buffer.num_sms, 8, 288, 32, 128),
@@ -189,9 +201,9 @@ class Buffer:
         """
 
         config_map = {
-            2: Config(Buffer.num_sms, 6, 256, 6, 128),
-            4: Config(Buffer.num_sms, 6, 256, 6, 128),
-            8: Config(Buffer.num_sms, 6, 256, 6, 128),
+            2: Config(Buffer.num_sms, 10, 256, 6, 128),
+            4: Config(Buffer.num_sms, 9, 256, 6, 128),
+            8: Config(Buffer.num_sms, 4, 256, 6, 128),
             16: Config(Buffer.num_sms, 2, 288, 28, 128),
             24: Config(Buffer.num_sms, 1, 288, 20, 128),
             32: Config(Buffer.num_sms, 1, 288, 20, 128),
@@ -431,6 +443,19 @@ class Buffer:
             async_finish, allocate_on_comm_stream)
         return combined_x, combined_topk_weights, EventOverlap(event)
 
+    def get_low_latency_usage_flag(self):
+        """
+        Return a host-side integer flag, which indicates the stages of low-latency kernels.
+        The initial value is 0, the low-latency dispatch will add 1 before communication, the low-latency combine
+            will add 1 after communication.
+        This is useful when there is no two-batch overlap, and you want to overlap H2D/D2H transfer with attention layers.
+
+        Returns:
+            flag: the host-side integer flag pointer. The value is in `int`, but returns a `uint64_t` pointer. Please
+                `reinterpret_cast` the returned value into `int*`.
+        """
+        return self.runtime.get_low_latency_usage_flag()
+
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
         """
         As low-latency kernels require part of the buffer to be zero-initialized, so it is vital to clean the buffer
@@ -448,6 +473,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
+                             cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                              use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
@@ -456,7 +482,7 @@ class Buffer:
             (specifically, IBGDA must be enabled).
         Even for ranks in the same node, NVLink are fully disabled for simplicity.
         Warning: as there are only two buffers, and the returned tensors reuse the buffer, you can not hold more than 2
-            low-latency kernels' result tensor at a single moment.
+            low-latency kernels' result tensors at a single moment.
 
         Arguments:
             x: `torch.Tensor` with `torch.bfloat16`, shaped as `[num_tokens, hidden]`, only several hidden shapes are
@@ -465,6 +491,9 @@ class Buffer:
                 are supported. `-1` indices (not selecting any expert) are supported.
             num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
             num_experts: the number of all experts.
+            cumulative_local_expert_recv_stats: a cumulative expert count tensor for statistics, which should have shape
+                `[num_local_experts]` and be typed as `torch.int`. This is useful for online service EP load balance
+                monitoring.
             use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
@@ -483,19 +512,21 @@ class Buffer:
                 Moreover, not all tokens are valid, only some of the `num_max_dispatch_tokens_per_rank * num_ranks` are,
                 as we do not synchronize CPU received count with GPU (also not incompatible with CUDA graph if synced).
             recv_count: a tensor shaped `[num_local_experts]` with type `torch.int`, indicating how many tokens each
-                expert receive. As mentioned before, not all tokens are valid in `recv_x`.
+                expert receives. As mentioned before, not all tokens are valid in `recv_x`.
             handle: the communication handle to be used in the `low_latency_combine` function.
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
+                                              cumulative_local_expert_recv_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, async_finish, return_recv_hook)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
-                             packed_recv_src_info, packed_recv_layout_range)
+                             packed_recv_src_info, packed_recv_layout_range,
+                             cumulative_local_expert_recv_stats)
         return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
             EventOverlap(event, tensors_to_record if async_finish else None), hook
 

@@ -76,6 +76,13 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
+
+    // Low-latency kernels' usage flag
+    if (low_latency_mode) {
+        CUDA_CHECK(cudaMallocHost(&low_latency_usage_flag, sizeof(int), cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostGetDevicePointer(&low_latency_usage_flag_mapped, const_cast<int*>(low_latency_usage_flag), 0));
+        *low_latency_usage_flag = 0;
+    }
 }
 
 Buffer::~Buffer() noexcept(false) {
@@ -997,6 +1004,11 @@ Buffer::internode_combine(const torch::Tensor& x, const std::optional<torch::Ten
     return {combined_x, combined_topk_weights, event};
 }
 
+uint64_t Buffer::get_low_latency_usage_flag() const {
+    EP_HOST_ASSERT(low_latency_usage_flag != nullptr);
+    return reinterpret_cast<uint64_t>(low_latency_usage_flag);
+}
+
 void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
     EP_HOST_ASSERT(low_latency_mode);
 
@@ -1018,6 +1030,7 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
+                             const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              int num_max_dispatch_tokens_per_rank, int num_experts,
                              bool use_fp8, bool async, bool return_recv_hook) {
     EP_HOST_ASSERT(low_latency_mode);
@@ -1030,6 +1043,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->dim() == 1 and cumulative_local_expert_recv_stats->is_contiguous());
+        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->size(0) == num_experts / num_ranks);
+    }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_scales = hidden / 128, num_topk = static_cast<int>(topk_idx.size(1));
@@ -1072,13 +1090,14 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         internode_ll::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                                packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
                                packed_recv_count.data_ptr<int>(),
+                               cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                                buffer.dispatch_rdma_send_buffer,
                                x.data_ptr(), topk_idx.data_ptr<int64_t>(),
                                next_clean_meta.first, next_clean_meta.second,
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks, use_fp8,
-                               workspace, launch_stream, phases);
+                               workspace, low_latency_usage_flag_mapped, launch_stream, phases);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1165,7 +1184,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                               next_clean_meta.first, next_clean_meta.second,
                               num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
                               num_topk, num_experts, rank, num_ranks,
-                              workspace, launch_stream,
+                              workspace, low_latency_usage_flag_mapped, launch_stream,
                               phases, zero_copy);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
@@ -1238,6 +1257,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
+        .def("get_low_latency_usage_flag", &deep_ep::Buffer::get_low_latency_usage_flag)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
